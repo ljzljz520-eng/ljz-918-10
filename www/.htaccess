@@ -1,0 +1,6 @@
+# 仅本地/内网访问守护面板
+# Require ip 127.0.0.1/32 10.0.0.0/8 192.168.0.0/16
+Options -Indexes
+<FilesMatch "\.(log|pid|sh|sql|md)$">
+  Require all denied
+</FilesMatch>

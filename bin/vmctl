@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# vmctl - 无人售货机守护服务统一控制入口（PHP 唯一允许调用的脚本）
+# 用法: vmctl <start|stop|restart|status|logs> [service-id] [--lines N]
+# 退出码: 0 成功 / 1 失败 / 2 参数错误 / 3 服务已在运行或已停止
+set -u
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUN_DIR="$ROOT_DIR/var/run"
+LOG_DIR="$ROOT_DIR/var/logs"
+SVC_DIR="$ROOT_DIR/services"
+
+# service-id|显示名|脚本|日志
+SERVICES=(
+  "pay-listener|支付监听|pay_listener.sh|pay-listener.log"
+  "stock-reporter|库存上报|stock_reporter.sh|stock-reporter.log"
+  "temp-collector|温控采集|temp_collector.sh|temp-collector.log"
+  "ad-player|广告播放|ad_player.sh|ad-player.log"
+)
+
+svc_field() { # $1=id $2=field index(1=name 2=script 3=log)
+  local id="$1" idx="$2" row f
+  for row in "${SERVICES[@]}"; do
+    IFS='|' read -r -a f <<< "$row"
+    if [[ "${f[0]}" == "$id" ]]; then echo "${f[$idx]}"; return 0; fi
+  done
+  return 1
+}
+
+valid_svc() { local id="$1" row f; for row in "${SERVICES[@]}"; do
+  IFS='|' read -r -a f <<< "$row"; [[ "${f[0]}" == "$id" ]] && return 0; done; return 1; }
+
+pid_alive() { # $1=pidfile  -> sets: ALIVE_PID (0=none)
+  ALIVE_PID=0
+  [[ -f "$1" ]] || return 1
+  local pid; pid="$(cat "$1" 2>/dev/null)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    ALIVE_PID="$pid"; return 0
+  fi
+  rm -f "$1"
+  return 1
+}
+
+start_one() {
+  local id="$1" script logfile pidfile
+  script="$(svc_field "$id" 2)"; logfile="$LOG_DIR/$(svc_field "$id" 3)"
+  pidfile="$RUN_DIR/$id.pid"
+  if pid_alive "$pidfile"; then
+    echo "[$id] 已在运行 (PID $ALIVE_PID)"; return 3
+  fi
+  [[ -x "$SVC_DIR/$script" ]] || { echo "[$id] 服务脚本不存在或不可执行: $script"; return 1; }
+  touch "$logfile"
+  # setsid 让服务脱离 Web 进程组；nohup 保证不被回收
+  setsid nohup "$SVC_DIR/$script" >> "$logfile" 2>&1 &
+  local spid=$!
+  # 等待 worker 自写 pid（最多 2 秒）
+  local i=0
+  while (( i < 20 )); do
+    if [[ -s "$pidfile" ]]; then
+      local wpid; wpid="$(cat "$pidfile")"
+      if [[ "$wpid" =~ ^[0-9]+$ ]] && kill -0 "$wpid" 2>/dev/null; then
+        echo "[$id] 已启动 (PID $wpid)"; return 0
+      fi
+    fi
+    kill -0 "$spid" 2>/dev/null || { echo "[$id] 启动失败，请查看日志 $logfile"; return 1; }
+    sleep 0.1; ((i++))
+  done
+  echo "[$id] 启动超时"; return 1
+}
+
+stop_one() {
+  local id="$1" pidfile
+  pidfile="$RUN_DIR/$id.pid"
+  if ! pid_alive "$pidfile"; then echo "[$id] 未在运行"; rm -f "$pidfile"; return 3; fi
+  local pid="$ALIVE_PID"
+  # 整组停止（setsid 建了独立进程组，PGID==PID）
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  local i=0
+  while (( i < 30 )) && kill -0 "$pid" 2>/dev/null; do sleep 0.1; ((i++)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+    sleep 0.3
+  fi
+  rm -f "$pidfile"
+  echo "[$id] 已停止"
+  return 0
+}
+
+status_one() { # CSV: id,state,pid,uptime
+  local id="$1" pidfile="$RUN_DIR/$id.pid" uptime=0 state="stopped" pid=0
+  if pid_alive "$pidfile"; then
+    state="running"; pid="$ALIVE_PID"
+    local etimes; etimes="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [[ "$etimes" =~ ^[0-9]+$ ]] && uptime="$etimes"
+  fi
+  printf '%s,%s,%s,%s\n' "$id" "$state" "$pid" "$uptime"
+}
+
+cmd_status() {
+  local ids=("$@") rc=0 row f
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    ids=()
+    for row in "${SERVICES[@]}"; do IFS='|' read -r -a f <<< "$row"; ids+=("${f[0]}"); done
+  fi
+  for id in "${ids[@]}"; do valid_svc "$id" || return 2; status_one "$id"; done
+  return 0
+}
+
+cmd_logs() {
+  local id="$1" lines="$2"
+  valid_svc "$id" || return 2
+  local logfile="$LOG_DIR/$(svc_field "$id" 3)"
+  [[ -f "$logfile" ]] || { echo "（暂无日志文件）"; return 0; }
+  tail -n "$lines" "$logfile"
+}
+
+cmd_batch() { # $1=action 其余=ids
+  local action="$1"; shift
+  local ids=("$@") rc=0 out r
+  [[ ${#ids[@]} -eq 0 ]] && { for row in "${SERVICES[@]}"; do IFS='|' read -r -a f <<< "$row"; ids+=("${f[0]}"); done; }
+  for id in "${ids[@]}"; do
+    valid_svc "$id" || { echo "未知服务: $id"; rc=1; continue; }
+    case "$action" in
+      start)   out="$(start_one "$id")"; r=$? ;;
+      stop)    out="$(stop_one "$id")";  r=$? ;;
+      restart)  stop_one "$id" >/dev/null 2>&1; out="$(start_one "$id")"; r=$? ;;
+    esac
+    echo "$out"
+    # “已是目标状态”(3) 不算整体失败
+    [[ $r -ne 0 && $r -ne 3 ]] && rc=1
+  done
+  return $rc
+}
+
+main() {
+  [[ $# -ge 1 ]] || { echo "用法: vmctl <start|stop|restart|status|logs> [service ...] [--lines N]"; exit 2; }
+  local action="$1"; shift || true
+  local lines=200 svcs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lines) lines="$2"; shift 2 ;;
+      --) shift ;;
+      -*) echo "未知选项: $1"; exit 2 ;;
+      *) svcs+=("$1"); shift ;;
+    esac
+  done
+  [[ "$lines" =~ ^[0-9]+$ ]] && (( lines >= 1 && lines <= 5000 )) || { echo "lines 非法"; exit 2; }
+
+  mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+  case "$action" in
+    status)  cmd_status "${svcs[@]}"; rc=$? ;;
+    logs)
+      [[ ${#svcs[@]} -eq 1 ]] || { echo "logs 需要指定一个服务"; exit 2; }
+      cmd_logs "${svcs[0]}" "$lines"; rc=$? ;;
+    start|stop|restart)
+      cmd_batch "$action" "${svcs[@]}"; rc=$? ;;
+    *) echo "未知动作: $action"; exit 2 ;;
+  esac
+  echo "RESULT=$rc"
+  exit $rc
+}
+main "$@"
